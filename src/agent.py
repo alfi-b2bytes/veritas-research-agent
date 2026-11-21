@@ -62,13 +62,20 @@ class Trace:
         print(f"  [{kind}] {detail}", file=sys.stderr)
 
 
+class ModelUnavailable(Exception):
+    """Raised when the Token Factory endpoint cannot serve a call."""
+
+
 def chat(model: str, system: str, user: str, temperature: float = 0.2) -> str:
-    resp = llm.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-    )
+    try:
+        resp = llm.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+        )
+    except Exception as exc:
+        raise ModelUnavailable(f"{type(exc).__name__}: {exc}") from exc
     return resp.choices[0].message.content
 
 
@@ -185,16 +192,34 @@ def research(question: str) -> str:
     seen_urls, sources = set(), []
     for round_n in range(1, MAX_ROUNDS + 1):
         trace.log("round", f"{round_n}/{MAX_ROUNDS}")
-        queries = plan_queries(question, trace) if round_n == 1 else refine_queries(question, sources, trace)
+        try:
+            queries = plan_queries(question, trace) if round_n == 1 else refine_queries(question, sources, trace)
+        except ModelUnavailable as exc:
+            trace.log("model-failure", str(exc)[:200])
+            return ("The language model endpoint (Nebius Token Factory) failed "
+                    f"during planning, so no research could run. Details: {exc}. "
+                    "This is an honest failure: nothing below was retrieved or "
+                    "inferred. Check the API key, model name and credits, then retry.")
         sources.extend(search_all(queries, seen_urls, trace))
-        if evidence_sufficient(question, sources, trace):
+        try:
+            if evidence_sufficient(question, sources, trace):
+                break
+        except ModelUnavailable as exc:
+            trace.log("model-failure", str(exc)[:200])
             break
     if not sources:
         return ("I could not retrieve any usable web sources for this question "
                 "(every search failed or returned nothing), so I cannot give a "
                 "sourced answer. Please try again later or rephrase the question.")
-    draft = synthesize(question, sources, trace)
-    final = verify(question, draft, trace)
+    try:
+        draft = synthesize(question, sources, trace)
+        final = verify(question, draft, trace)
+    except ModelUnavailable as exc:
+        trace.log("model-failure", str(exc)[:200])
+        titles = "\n".join(f"  [{i+1}] {s['title']} - {s['url']}" for i, s in enumerate(sources[:10]))
+        return ("Retrieval succeeded but the language model endpoint (Nebius Token "
+                f"Factory) failed during synthesis: {exc}. Partial result - the "
+                "sources gathered, unverified and unsynthesized:\n" + titles)
     trace.log("done", f"{len(sources)} sources used")
     return final
 
